@@ -1,16 +1,16 @@
 # Minirl
 
-A heavily modified version of minirl that can be found here...
+A heavily modified version of linenoise that can be found here...
 
-    https://github.com/antirez/minirl
+    https://github.com/antirez/linenoise
 
 with portions of code included from here...
 
     https://github.com/philipc/tinyrl
 
-The changes to the minirl code are extensive enough that this project
+The changes to the linenoise code are extensive enough that this project
 can be considered a distinct piece of work. 
-It is not compatible with minirl.
+It is not compatible with linenoise.
 
 * History handling.
 * Completion.
@@ -84,25 +84,6 @@ Note that for history to work, you have to set a length for the history
 a proper one). This is accomplished using the `minirl_history_set_max_len`
 function.
 
-## Mask mode
-
-Sometimes it is useful to allow the user to type passwords or other
-secrets that should not be displayed. For such situations minirl supports
-a "mask mode" that will just replace the characters the user is typing 
-with `*` characters, like in the following example:
-
-    $ ./minirl_example
-    hello> get mykey
-    echo: 'get mykey'
-    hello> /mask
-    hello> *********
-
-You can enable and disable mask mode using the following function:
-
-    void minirl_set_mask_mode(minirl_st * minirl, bool enable);
-
-Mask mode is untested.
-
 ## Completion
 
 TODO: Document completion.
@@ -116,6 +97,6 @@ user typed. You can do this by calling the following function:
 
 ## Related projects
 
-https://github.com/antirez/minirl
+https://github.com/antirez/linenoise
 https://github.com/philipc/tinyrl
 
