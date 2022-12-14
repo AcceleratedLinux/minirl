@@ -154,7 +154,11 @@ static int
 enable_raw_mode(minirl_st * const minirl, int const fd)
 {
 	if (!isatty(fd)) {
-		goto fatal;
+		/*
+		 * Don't consider this fatal - Just don't attempt to set
+		 * TTY settings.
+		 */
+		return 0;
 	}
 
 	if (tcgetattr(fd, &minirl->orig_termios) == -1) {
