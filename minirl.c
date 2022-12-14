@@ -1052,7 +1052,7 @@ static int minirl_edit(
 		uint8_t c;
 		int const nread = io_read(minirl->in.fd, &c, 1);
 		if (nread <= 0) {
-			break;
+			return -1;
 		}
 
 		minirl_key_binding_handler_cb handler = NULL;
