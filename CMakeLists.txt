@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.10)
 
 project(minirl
   VERSION 1.0.0
@@ -28,4 +28,4 @@ target_include_directories(minirl
 
 file(GLOB headers include/*.h)
 install(FILES ${headers} DESTINATION include/minirl)
-install(TARGETS minirl ARCHIVE DESTINATION lib)
+install(TARGETS minirl DESTINATION lib)
