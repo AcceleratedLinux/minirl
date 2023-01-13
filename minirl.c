@@ -1044,9 +1044,8 @@ static int minirl_edit(
 	 */
 	minirl_history_add(minirl, "");
 
-	if (io_write(minirl->out.fd, prompt, l->prompt_len) == -1) {
-		return -1;
-	}
+	/* Get the prompt printed by refreshing the empty line. */
+	minirl_refresh_line(minirl);
 
 	for (;;) {
 		uint8_t c;
