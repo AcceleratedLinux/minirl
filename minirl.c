@@ -1,5 +1,6 @@
 #include "minirl.h"
 #include "buffer.h"
+#include "char.h"
 #include "export.h"
 #include "io.h"
 #include "private.h"
@@ -33,6 +34,68 @@ enum KEY_ACTION
 	ESC = 27,		/* Escape */
 	BACKSPACE =  127	/* Backspace */
 };
+
+typedef struct internal_line_buffer_st {
+	size_t edit_point;
+	size_t end;
+	char * alloced_buffer;
+	char const * buffer;
+} internal_line_buffer_st;
+
+static bool
+internal_line_buffer_init(
+    internal_line_buffer_st * const internal,
+    minirl_state_st * const l,
+    echo_st const * const echo)
+{
+	/*
+	 * Create a copy of the line buffer. If the echo char is enabled,
+	 * replace the real characters with the echo character if one is
+	 * defined, else don't replace with anything.
+	 * This representation will be used to determine what should be printed
+	 * to the display, and where to place the cursor.
+	 * As UTF-8 chars may be wider than the echo char (which is plain ASCII)
+	 * the cursor may be located at a different position when using an echo
+	 * char.
+	 */
+	if (!echo->disable) {
+		/* Simply echo the line. */
+		internal->edit_point = l->pos;
+		internal->end = l->len;
+		internal->alloced_buffer = NULL;
+		internal->buffer = l->line_buf->b;
+	}
+	else if (echo->ch == '\0') {
+		internal->edit_point = 0;
+		internal->end = 0;
+		internal->alloced_buffer = NULL;
+		internal->buffer = "";
+	} else {
+		/* Replace the line with echo char. */
+		internal->edit_point = 0;
+		internal->end = 0;
+		for (size_t i = 0; ; i = grapheme_next(l->line_buf->b, l->len, i)) {
+			if (i == l->pos) {
+				internal->edit_point = internal->end;
+			}
+			if (i >= l->len) {
+				break;
+			}
+			internal->end++;
+		}
+
+		internal->alloced_buffer = chrdup(echo->ch, internal->end);
+		internal->buffer = internal->alloced_buffer;
+	}
+
+	return internal->buffer != NULL;
+}
+
+static void
+internal_line_buffer_free(internal_line_buffer_st const * const internal)
+{
+	free(internal->alloced_buffer);
+}
 
 int
 minirl_printf(minirl_st * const minirl, char const * const fmt, ...)
@@ -82,7 +145,7 @@ static void
 move_edit_position_right(minirl_state_st * const l)
 {
 	if (l->pos < l->len) {
-		l->pos++;
+		l->pos = grapheme_next(l->line_buf->b, l->len, l->pos);
 		minirl_state_cursor_refresh_required(l);
 	}
 }
@@ -91,7 +154,7 @@ static void
 move_edit_position_left(minirl_state_st * const l)
 {
 	if (l->pos > 0) {
-		l->pos--;
+		l->pos = grapheme_prev(l->line_buf->b, l->len, l->pos);
 		minirl_state_cursor_refresh_required(l);
 	}
 }
@@ -228,48 +291,65 @@ minirl_screen_clear(minirl_st * const minirl)
 }
 
 static void
-cursor_add_ch(
-	cursor_st * const cursor,
-	char const ch,
-	size_t const terminal_width,
-	echo_st const * const echo)
+string_wrap(
+	char const * const s,
+	size_t const len,
+	size_t const row_width,
+	cursor_st * const cursor)
 {
-	char const echo_ch = echo->disable ? echo->ch : ch;
+	for (size_t point = 0; point < len;) {
+		size_t next;
+		size_t const width = grapheme_width(s, len, point, &next);
 
-	if (echo_ch == '\0') {
-		return;
-	}
-	cursor->col++;
-	/* TODO: Support '\t' <TAB> characters. 8 chars per TAB. */
-	if (cursor->col == terminal_width || echo_ch == '\n') {
-		cursor->row++;
-		cursor->col = 0;
+		if (width > 0) {
+			cursor->col += width;
+			if (cursor->col > row_width) {
+				cursor->row++;
+				cursor->col = width;
+			}
+		} else if (s[point] == '\n') {
+			/*
+			 * Special case for '\n', which moves the cursor
+			 * to the beginning of the next line.
+			 * This char won't normally be in the line buffer as it
+			 * normally ends a command, but will be present if the
+			 * character is embedded within quotes.
+			 */
+			cursor->row++;
+			cursor->col = 0;
+		}
+		point = next;
 	}
 }
 
 static void
-cursor_calculate_position(
-	size_t const terminal_width,
-	size_t const prompt_len,
-	char const * const line,
-	size_t const max_chars,
-	echo_st const * const echo,
-	cursor_st * const cursor_out)
+calculate_cursor_position(
+    minirl_state_st * const l,
+    cursor_st * const cursor,
+    size_t const point,
+    internal_line_buffer_st const * const internal)
 {
-	/* Assume no newlines in the prompt. */
-	cursor_st cursor = {
-		.row = prompt_len / terminal_width,
-		.col = prompt_len % terminal_width
-	};
-	size_t char_count = 0;
+	*cursor = (cursor_st){ 0 };
 
-	for (char const *pch = line;
-	     *pch != '\0' && char_count < max_chars;
-	     pch++, char_count++) {
-		cursor_add_ch(&cursor, *pch, terminal_width, echo);
+	string_wrap(l->prompt, l->prompt_len, l->terminal_width, cursor);
+	if (internal != NULL) {
+		string_wrap(internal->buffer, point, l->terminal_width, cursor);
+
+		if (cursor->col == l->terminal_width
+		    || (point < internal->end
+			&& cursor->col + grapheme_width(internal->buffer,
+							internal->end,
+							point,
+							NULL) > l->terminal_width)) {
+			/*
+			 * At EOL or the next character is too wide, so
+			 * move to the next line.
+			 */
+			cursor->row++;
+			cursor->col = 0;
+		}
 	}
-	*cursor_out = cursor;
-};
+}
 
 static void
 emit_set_column(struct buffer * const ab, size_t const column_num)
@@ -325,20 +405,33 @@ minirl_refresh_cursor(minirl_st * const minirl)
 {
 	bool success = true;
 	minirl_state_st * const l = &minirl->state;
+	internal_line_buffer_st internal;
 
-	/* Calculate row and column of current cursor. */
+	if (!internal_line_buffer_init(&internal, l, &minirl->options.echo)) {
+		minirl_state_had_error(l);
+		success = false;
+		goto done;
+	}
+
 	cursor_st current_cursor;
-	cursor_calculate_position(l->terminal_width,
-				  l->prompt_len,
-				  l->line_buf->b,
-				  l->pos,
-				  &minirl->options.echo,
-				  &current_cursor);
+	calculate_cursor_position(l, &current_cursor, internal.edit_point, &internal);
 
 	/* Check that the cursor has actually moved. */
 	if (current_cursor.row == l->previous_cursor.row
 	    && current_cursor.col == l->previous_cursor.col) {
-		return true;
+		l->flags.cursor_refresh_required = false;
+		goto done;
+	}
+
+	/*
+	 * A full refresh may be still required if the cursor is on a row that
+	 * hasn't been written to yet. This can happen if a row is completely
+	 * full and the cursor is moved to the end of that line. In that case
+	 * the cursor needs to go onto a new line.
+	 */
+	if (current_cursor.row >= l->max_rows) {
+		minirl_state_refresh_required(l);
+		goto done;
 	}
 
 	struct buffer ab;
@@ -374,6 +467,9 @@ minirl_refresh_cursor(minirl_st * const minirl)
 
 	buffer_clear(&ab);
 
+done:
+	internal_line_buffer_free(&internal);
+
 	return success;
 }
 
@@ -387,27 +483,20 @@ minirl_refresh_line(minirl_st * const minirl)
 {
 	bool success = true;
 	minirl_state_st * const l = &minirl->state;
-	size_t const prompt_len = strlen(l->prompt);
+	internal_line_buffer_st internal;
+
+	if (!internal_line_buffer_init(&internal, l, &minirl->options.echo)) {
+		minirl_state_had_error(l);
+		success = false;
+		goto done;
+	}
 
 	l->terminal_width = minirl_terminal_width(minirl);
 
-	/* Calculate row and column of end of line. */
-	cursor_st line_end_cursor;
-	cursor_calculate_position(l->terminal_width,
-				  prompt_len,
-				  l->line_buf->b,
-				  l->len,
-				  &minirl->options.echo,
-				  &line_end_cursor);
-
-	/* Calculate row and column of end of cursor. */
 	cursor_st current_cursor;
-	cursor_calculate_position(l->terminal_width,
-				  prompt_len,
-				  l->line_buf->b,
-				  l->pos,
-				  &minirl->options.echo,
-				  &current_cursor);
+	cursor_st line_end_cursor;
+	calculate_cursor_position(l, &current_cursor, internal.edit_point, &internal);
+	calculate_cursor_position(l, &line_end_cursor, internal.end, &internal);
 
 	struct buffer ab;
 
@@ -441,28 +530,18 @@ minirl_refresh_line(minirl_st * const minirl)
 
 	/* Write the prompt and the current buffer content */
 	buffer_append(&ab, l->prompt, strlen(l->prompt));
-	if (minirl->options.echo.disable) {
-		if (minirl->options.echo.ch != '\0') {
-			for (size_t i = 0; i < l->len; i++) {
-				buffer_append(&ab, &minirl->options.echo.ch, 1);
-			}
-		}
-	} else {
-		buffer_append(&ab, l->line_buf->b, l->len);
-	}
+	buffer_append(&ab, internal.buffer, internal.end);
 
 	/*
-	 * If we are at the very end of the screen with our cursor, we need to
+	 * If we are at the very RHS of the screen with our cursor, we need to
 	 * emit a newline and move the cursor to the first column of the next
 	 * line.
 	 * If the last character on the row is a '\n' there is no need to emit
 	 * the newline because that character already moved the cursor.
 	 */
-	if (l->pos > 0
-	    && l->pos == l->len
-	    && current_cursor.row > 0
-	    && current_cursor.col == 0
-	    && l->line_buf->b[l->pos - 1] != '\n') {
+	if (line_end_cursor.row > 0
+	    && line_end_cursor.col == 0
+	    && internal.buffer[internal.end - 1] != '\n') {
 		buffer_append(&ab, "\n\r", strlen("\n\r"));
 	}
 
@@ -484,8 +563,18 @@ minirl_refresh_line(minirl_st * const minirl)
 	l->previous_cursor = current_cursor;
 	l->previous_line_end = line_end_cursor;
 
-	/* Update max_rows if needed. */
-	size_t const num_rows = line_end_cursor.row + 1;
+	/*
+	 * Update max_rows if needed. Note that the cursor may be beyond the
+	 * line end if the line fills the width of the terminal. In that case
+	 * the cursor needs to go onto the next line.
+	 */
+	size_t num_rows;
+
+	if (current_cursor.row > line_end_cursor.row) {
+		num_rows = current_cursor.row + 1;
+	} else {
+		num_rows = line_end_cursor.row + 1;
+	}
 
 	if (num_rows > l->max_rows) {
 		l->max_rows = num_rows;
@@ -499,6 +588,9 @@ minirl_refresh_line(minirl_st * const minirl)
 
 	buffer_clear(&ab);
 
+done:
+	internal_line_buffer_free(&internal);
+
 	return success;
 }
 
@@ -508,42 +600,56 @@ minirl_refresh_line(minirl_st * const minirl)
  * On error writing to the terminal -1 is returned, otherwise 0.
  */
 static int
-minirl_edit_insert(minirl_st * const minirl, char const c)
+minirl_edit_insert(
+	minirl_st * const minirl,
+	char const * const text,
+	size_t const len)
 {
 	minirl_state_st * const l = &minirl->state;
+	size_t const required_len = l->len + len;
 
-	if (l->len >= l->line_buf->capacity) {
-		if (!buffer_grow(l->line_buf, l->len - l->line_buf->capacity)) {
+	if (required_len >= l->line_buf->capacity) {
+		if (!buffer_grow(l->line_buf, required_len - l->line_buf->capacity)) {
 			minirl_state_had_error(l);
 			return -1;
 		}
 	}
 
-	/* Insert the new char into the line buffer. */
+	/* Insert the new text into the line buffer. */
 	if (l->len != l->pos) {
-		memmove(l->line_buf->b + l->pos + 1,
+		memmove(l->line_buf->b + l->pos + len,
 			l->line_buf->b + l->pos,
 			l->len - l->pos);
 	}
-	l->line_buf->b[l->pos] = c;
-	l->len++;
-	l->pos++;
+	memcpy(l->line_buf->b + l->pos, text, len);
+	l->len += len;
+	l->pos += len;
 	l->line_buf->b[l->len] = '\0';
 
 	bool require_full_refresh = true;
 
-	if (l->len == l->pos) { /* Cursor is at the end of the line. */
-		cursor_st new_line_end = l->previous_cursor;
+	if (l->len == l->pos) { /* Editing at the end of the line. */
+		cursor_st const old_line_end = l->previous_cursor;
+		cursor_st new_line_end;
+		internal_line_buffer_st internal;
 
-		cursor_add_ch(&new_line_end, c, l->terminal_width, &minirl->options.echo);
+		if (!internal_line_buffer_init(&internal, l, &minirl->options.echo)) {
+			minirl_state_had_error(l);
+			return -1;
+		}
+
+		calculate_cursor_position(l, &new_line_end, internal.end, &internal);
 		/*
 		 * As long as the cursor remains on the same row as before the
 		 * current character was added, and hasn't filled the terminal
 		 * width, there is no need for a full refresh.
 		 * If the character that filled the row (so col == 0) was a '\n'
-		 * then the line still doesn't need to be refreshed.
+		 * then the line still doesn't need to be refreshed as the
+		 * terminal will update the cursor automatically.
 		 */
-		if (new_line_end.col > 0 || c == '\n') {
+		if (new_line_end.row == old_line_end.row
+			|| (new_line_end.col == 0 && l->line_buf->b[l->len - 1] == '\n')) {
+
 			require_full_refresh = false;
 			/*
 			 * After the io_write() is done the saved cursor positions
@@ -553,22 +659,27 @@ minirl_edit_insert(minirl_st * const minirl, char const c)
 			 */
 			l->previous_cursor = new_line_end;
 			l->previous_line_end = new_line_end;
-			if (l->max_rows < (l->previous_line_end.row + 1)) {
-				l->max_rows = l->previous_line_end.row + 1;
+			if (l->max_rows < (new_line_end.row + 1)) {
+				l->max_rows = new_line_end.row + 1;
 			}
 		}
+
+		internal_line_buffer_free(&internal);
 	}
 
 	if (require_full_refresh) {
 		minirl_state_refresh_required(l);
-	} else {
-		char const d = minirl->options.echo.disable ? minirl->options.echo.ch : c;
-
-		if (d != '\0') {
-			if (io_write(minirl->out.fd, &d, sizeof d) == -1) {
-				minirl_state_had_error(l);
-				return -1;
-			}
+	} else if (!minirl->options.echo.disable) {
+		if (io_write(minirl->out.fd, text, len) == -1) {
+			minirl_state_had_error(l);
+			return -1;
+		}
+	} else if (minirl->options.echo.ch != '\0') {
+		if (io_write(minirl->out.fd,
+			     &minirl->options.echo.ch,
+			     sizeof minirl->options.echo.ch) == -1) {
+			minirl_state_had_error(l);
+			return -1;
 		}
 	}
 
@@ -618,6 +729,32 @@ minirl_edit_history_next(minirl_st * const minirl, enum minirl_history_direction
 	return false;
 }
 
+static void
+delete_text(minirl_state_st * const l, size_t const start, size_t const end)
+{
+	if (end == start) {
+		return;
+	}
+
+	/* Move any text which is left, including terminator. */
+	size_t const delta = end - start;
+
+	memmove(&l->line_buf->b[start],
+			&l->line_buf->b[start + delta],
+			l->len + 1 - end);
+	l->len -= delta;
+
+	/* Now adjust the edit position. */
+	if (l->pos > end) {
+		/* Move the insertion point back appropriately. */
+		l->pos -= delta;
+	} else if (l->pos > start) {
+		/* Move the insertion point to the start. */
+		l->pos = start;
+	}
+	l->line_buf->b[l->len] = '\0';
+}
+
 /*
  * Delete the character at the right of the cursor without altering the cursor
  * position.
@@ -627,11 +764,9 @@ static bool
 delete_char_right(minirl_state_st * const l)
 {
 	if (l->len > 0 && l->pos < l->len) {
-		memmove(l->line_buf->b + l->pos,
-			l->line_buf->b + l->pos + 1,
-			l->len - l->pos - 1);
-		l->len--;
-		l->line_buf->b[l->len] = '\0';
+		size_t const end = grapheme_next(l->line_buf->b, l->len, l->pos);
+
+		delete_text(l, l->pos, end);
 
 		return true;
 	}
@@ -643,12 +778,10 @@ static bool
 delete_char_left(minirl_state_st * const l)
 {
 	if (l->pos > 0 && l->len > 0) {
-		memmove(l->line_buf->b + l->pos - 1,
-			l->line_buf->b + l->pos,
-			l->len - l->pos);
-		l->pos--;
-		l->len--;
-		l->line_buf->b[l->len] = '\0';
+		size_t const end = l->pos;
+
+		l->pos = char_prev(l->line_buf->b, l->len, l->pos);
+		delete_text(l, l->pos, end);
 
 		return true;
 	}
@@ -661,12 +794,7 @@ delete_all_chars_left(minirl_state_st * const l)
 {
 	/* Delete all chars to the left of the cursor. */
 	if (l->pos > 0 && l->len > 0) {
-		memmove(l->line_buf->b,
-			l->line_buf->b + l->pos,
-			l->len - l->pos);
-		l->len -= l->pos;
-		l->pos = 0;
-		l->line_buf->b[l->len] = '\0';
+		delete_text(l, 0, l->pos);
 
 		return true;
 	}
@@ -719,17 +847,36 @@ static bool
 swap_chars_at_cursor(minirl_state_st * const l)
 {
 	if (l->pos > 0 && l->pos < l->len) {
-		char const aux = l->line_buf->b[l->pos - 1];
+		size_t const prev = grapheme_prev(l->line_buf->b, l->len, l->pos);
+		size_t const prev_len = l->pos - prev;
+		size_t const next = grapheme_next(l->line_buf->b, l->len, l->pos);
+		size_t const next_len = next - l->pos;
+		char * const temp_buf = malloc(prev_len + next_len);
 
-		l->line_buf->b[l->pos - 1] = l->line_buf->b[l->pos];
-		l->line_buf->b[l->pos] = aux;
-		if (l->pos != l->len - 1) {
-			l->pos++;
+		if (temp_buf == NULL)
+		{
+			goto not_swapped;
 		}
-
+		memcpy(temp_buf, l->line_buf->b + l->pos, next_len);
+		memcpy(temp_buf + next_len, l->line_buf->b + prev, prev_len);
+		memcpy(l->line_buf->b + prev, temp_buf, prev_len + next_len);
+		free(temp_buf);
+		/*
+		 * Update the edit position so that it's located just after the
+		 * character to the left.
+		 */
+		l->pos = l->pos - prev_len + next_len;
+		/*
+		 * Now move the edit position along unless that would mean
+		 * another swap command wouldn't do anything.
+		 */
+		if (grapheme_next(l->line_buf->b, l->len, l->pos) < l->len) {
+			l->pos = next;
+		}
 		return true;
 	}
 
+not_swapped:
 	return false;
 }
 
@@ -763,6 +910,9 @@ minirl_edit_done(minirl_st * const minirl)
 {
 	remove_current_line_from_history(minirl);
 	move_edit_position_to_end(&minirl->state);
+	if (minirl->state.flags.cursor_refresh_required) {
+		minirl_refresh_cursor(minirl);
+	}
 }
 
 static bool
@@ -770,7 +920,7 @@ null_handler(minirl_st * const minirl, char const * const key, void * const user
 {
 	/*
 	 * Ignore this key.
-	 * Handy for ignoring unhandled escape sequence characeters.
+	 * Handy for ignoring unhandled escape sequence characters.
 	 */
 	return true;
 }
@@ -846,7 +996,7 @@ static bool
 default_handler(minirl_st * const minirl, char const *key, void * const user_ctx)
 {
 	/* Insert the key at the current cursor position. */
-	minirl_edit_insert(minirl, *key);
+	minirl_text_insert(minirl, key);
 
 	return true;
 }
@@ -963,10 +1113,57 @@ ctrl_w_handler(minirl_st * const minirl, char const *key, void * const user_ctx)
 	return true;
 }
 
+typedef struct char_st {
+	int len;
+	char bytes[MAX_CHAR_LEN + 1];
+} char_st;
+
+static char_st
+char_read(int const fd)
+{
+	/*
+	 * Read either an ASCII or UTF-8 char from the input stream, depending on
+	 * whether UTF-8 support is included.
+	 */
+	char_st ch = { 0 };
+	int nread;
+
+	nread = io_read(fd, &ch.bytes[0], sizeof(ch.bytes[ch.len]));
+	if (nread == EOF) {
+		ch.len = -1;
+		goto done;
+	}
+
+	ch.len = char_len(ch.bytes[0]);
+	if (ch.len == 0 || ch.len > MAX_CHAR_LEN) {
+		ch.len = -1;
+		goto done;
+	}
+
+	/* Read the rest of the bytes making up this char (will be 0 for ASCII). */
+	for (int i = 1; i < ch.len; i++) {
+		nread = io_read(fd, &ch.bytes[i], 1);
+		if (nread == EOF) {
+			ch.len = -1;
+			goto done;
+		}
+	}
+	ch.bytes[ch.len] = '\0';
+
+	bool const is_valid_char = char_decode(ch.bytes, ch.len, NULL) == ch.len;
+	if (!is_valid_char) {
+		ch.len = -1;
+		goto done;
+	}
+
+done:
+	return ch;
+}
+
 static void
 key_handler_lookup(
 	minirl_st * const minirl,
-	uint8_t * const c,
+	char_st * const ch,
 	minirl_key_binding_handler_cb *handler,
 	void ** const user_ctx)
 {
@@ -976,28 +1173,35 @@ key_handler_lookup(
 	 */
 	minirl_keymap_st *keymap = minirl->keymap;
 
-	for (;;) {
-		uint8_t const index = *c;
+	for (int i = 0; i < ch->len;) {
+		uint8_t const index = ch->bytes[i];
 
 		if (keymap->keys[index].handler != NULL) {
-			/* Indicates the end a sequence. */
+			/*
+			 * For unbound UTF-8 chars the first
+			 * byte will assign the default handler. If there is a handler
+			 * assigned to a specific UTF-8 char then a handler will be
+			 * found at the last byte in the sequence.
+			 */
 			*handler = keymap->keys[index].handler;
 			*user_ctx = keymap->keys[index].user_ctx;
-			break;
 		}
 		keymap = keymap->keys[index].keymap;
 		if (keymap == NULL) {
 			break;
 		}
 
-		/* Get here with multi-byte sequences. */
-		uint8_t new_c;
-		int const nread = io_read(minirl->in.fd, &new_c, 1);
+		i++;
+		if (i >= ch->len) {
+			/* Get here with multi-byte sequences. */
+			char_st new_ch = char_read(minirl->in.fd);
 
-		if (nread <= 0) {
-			break;
+			if (new_ch.len <= 0) {
+				break;
+			}
+			*ch = new_ch;
+			i = 0;
 		}
-		*c = new_c;
 	}
 }
 
@@ -1030,12 +1234,12 @@ static int minirl_edit(
 
 	/* Buffer starts empty. */
 	l->line_buf->b[0] = '\0';
-	cursor_calculate_position(l->terminal_width,
-				  l->prompt_len,
-				  l->line_buf->b,
-				  0,
-				  &minirl->options.echo,
-				  &l->previous_cursor);
+
+	/*
+	 * The line buffer is empty so there's no need to pass an internal
+	 * representation of it.
+	 */
+	calculate_cursor_position(l, &l->previous_cursor, 0, NULL);
 	l->previous_line_end = l->previous_cursor;
 
 	/*
@@ -1048,34 +1252,35 @@ static int minirl_edit(
 	minirl_refresh_line(minirl);
 
 	for (;;) {
-		uint8_t c;
-		int const nread = io_read(minirl->in.fd, &c, 1);
-		if (nread <= 0) {
+		char_st ch = char_read(minirl->in.fd);
+
+		if (ch.len <= 0) {
 			return -1;
 		}
 
 		minirl_key_binding_handler_cb handler = NULL;
 		void *user_ctx = NULL;
 
-		key_handler_lookup(minirl, &c, &handler, &user_ctx);
+		key_handler_lookup(minirl, &ch, &handler, &user_ctx);
 
 		if (handler != NULL) {
-			/* TODO: Should pass the complete key sequence. */
-			char key_str[2] = { c, '\0' };
-
 			l->flags = (minirl_key_handler_flags_st){0};
 
-			bool const res = handler(minirl, key_str, user_ctx);
+			/* TODO: Should pass the complete key sequence. */
+			bool const res = handler(minirl, ch.bytes, user_ctx);
 			(void)res; //* TODO: Treat false as an error?
 
 			if (l->flags.error) {
 				return -1;
 			}
 
+			if (!l->flags.done
+			    && !l->flags.refresh_required
+			    && l->flags.cursor_refresh_required) {
+				minirl_refresh_cursor(minirl);
+			}
 			if (l->flags.refresh_required) {
 				minirl_refresh_line(minirl);
-			} else if (!l->flags.done && l->flags.cursor_refresh_required) {
-				minirl_refresh_cursor(minirl);
 			}
 
 			if (l->flags.done) {
@@ -1358,17 +1563,15 @@ minirl_text_len_insert(
 	char const * const text,
 	size_t const length)
 {
-	for (size_t i = 0; i < length; i++) {
-		minirl_edit_insert(minirl, text[i]);
+	if (minirl_edit_insert(minirl, text, length) < 0) {
+		return false;
 	}
 
 	return true;
 }
 
 bool
-minirl_text_insert(
-	minirl_st * const minirl,
-	char const * const text)
+minirl_text_insert(minirl_st * const minirl, char const * const text)
 {
 	return minirl_text_len_insert(minirl, text, strlen(text));
 }
