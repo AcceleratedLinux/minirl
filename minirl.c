@@ -780,7 +780,7 @@ delete_char_left(minirl_state_st * const l)
 	if (l->pos > 0 && l->len > 0) {
 		size_t const end = l->pos;
 
-		l->pos = char_prev(l->line_buf->b, l->len, l->pos);
+		l->pos = grapheme_prev(l->line_buf->b, l->len, l->pos);
 		delete_text(l, l->pos, end);
 
 		return true;

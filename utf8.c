@@ -18,6 +18,7 @@ enum {
 	UTF8_GRAPHEME_BREAK_T,
 	UTF8_GRAPHEME_BREAK_LV,
 	UTF8_GRAPHEME_BREAK_LVT,
+	UTF8_GRAPHEME_BREAK_ZWJ,
 };
 
 #include "utf8data.c"
@@ -211,7 +212,7 @@ static bool utf8_grapheme_break(uint32_t c1, uint32_t c2)
 		return false;
 
 	/* GB9 */
-	if (b2 == UTF8_GRAPHEME_BREAK_EXTEND)
+	if (b2 == UTF8_GRAPHEME_BREAK_EXTEND || b2 == UTF8_GRAPHEME_BREAK_ZWJ)
 		return false;
 
 	/* GB9a */
