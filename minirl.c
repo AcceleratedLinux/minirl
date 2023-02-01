@@ -1129,7 +1129,7 @@ char_read(int const fd)
 	int nread;
 
 	nread = io_read(fd, &ch.bytes[0], sizeof(ch.bytes[ch.len]));
-	if (nread == EOF) {
+	if (nread <= 0) {
 		ch.len = -1;
 		goto done;
 	}
@@ -1143,7 +1143,7 @@ char_read(int const fd)
 	/* Read the rest of the bytes making up this char (will be 0 for ASCII). */
 	for (int i = 1; i < ch.len; i++) {
 		nread = io_read(fd, &ch.bytes[i], 1);
-		if (nread == EOF) {
+		if (nread <= 0) {
 			ch.len = -1;
 			goto done;
 		}
