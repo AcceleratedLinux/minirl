@@ -352,14 +352,6 @@ calculate_cursor_position(
 }
 
 static void
-emit_set_column(struct buffer * const ab, size_t const column_num)
-{
-	char buf[10];
-
-	buffer_snprintf(ab, buf, sizeof buf, ESCAPESTR "[%zuG", column_num);
-}
-
-static void
 emit_row_clear(struct buffer * const ab)
 {
 	/* Note: Also moves the cursor to the start of the row. */
@@ -398,6 +390,20 @@ emit_cursor_left(struct buffer * const ab, size_t const count)
 	char buf[10];
 
 	buffer_snprintf(ab, buf, sizeof buf, ESCAPESTR "[%zuD", count);
+}
+
+static void
+emit_set_column(struct buffer * const ab, size_t const column_num)
+{
+	/*
+	 * '<ESC>[<#>G' doesn't always seem to work, so achieve this by moving
+	 * the cursor to the beginning of the line and then right by the desired
+	 * amount.
+	 */
+	buffer_append(ab, "\r", 1);
+	if (column_num > 1) {
+		emit_cursor_right(ab, column_num - 1);
+	}
 }
 
 static bool
